@@ -1,0 +1,100 @@
+name: Build k3s Vendor Tarballs
+
+on:
+  schedule:
+    # Check for new releases daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Specific k3s version (e.g., v1.34.1+k3s1). Leave empty to check for new releases.'
+        required: false
+        type: string
+
+jobs:
+  check-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.find-versions.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get existing releases
+        id: existing
+        run: |
+          gh release list --limit 100 --json tagName -q '.[].tagName' > existing.txt || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Find new k3s versions
+        id: find-versions
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "versions=[\"${{ inputs.version }}\"]" >> $GITHUB_OUTPUT
+          else
+            RELEASES=$(curl -s "https://api.github.com/repos/k3s-io/k3s/releases?per_page=20" | \
+              jq -r '.[] | select(.prerelease == false) | .tag_name' | head -5)
+
+            NEW_VERSIONS="[]"
+            for ver in $RELEASES; do
+              SAFE_VER=$(echo "$ver" | tr '+' '-')
+              if ! grep -q "^${SAFE_VER}$" existing.txt 2>/dev/null; then
+                NEW_VERSIONS=$(echo "$NEW_VERSIONS" | jq -c ". + [\"$ver\"]")
+              fi
+            done
+
+            echo "versions=$NEW_VERSIONS" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: check-releases
+    if: needs.check-releases.outputs.versions != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ${{ fromJson(needs.check-releases.outputs.versions) }}
+      fail-fast: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Parse version
+        id: version
+        run: |
+          VERSION="${{ matrix.version }}"
+          VERSION="${VERSION#v}"
+          SAFE_VERSION=$(echo "$VERSION" | tr '+' '-')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "safe_version=$SAFE_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Clone k3s
+        run: |
+          git clone --depth 1 --branch "v${{ steps.version.outputs.version }}" \
+            https://github.com/k3s-io/k3s.git k3s-src
+
+      - name: Create vendor tarball
+        run: |
+          cd k3s-src
+          go mod download
+          go mod vendor
+
+          TARBALL="k3s-${{ steps.version.outputs.safe_version }}-vendor.tar.gz"
+          tar -czf "../${TARBALL}" vendor
+          echo "TARBALL=${TARBALL}" >> $GITHUB_ENV
+
+      - name: Create Release
+        run: |
+          TAG="${{ steps.version.outputs.safe_version }}"
+          SHA256=$(sha256sum "$TARBALL" | awk '{print $1}')
+
+          gh release create "$TAG" \
+            --title "k3s ${{ matrix.version }}" \
+            --notes "Vendor tarball for k3s ${{ matrix.version }}"$'\n\n'"SHA256: \`${SHA256}\`" \
+            "$TARBALL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
