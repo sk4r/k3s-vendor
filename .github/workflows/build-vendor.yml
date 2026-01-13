@@ -33,14 +33,22 @@ jobs:
         id: find-versions
         run: |
           if [ -n "${{ inputs.version }}" ]; then
-            echo "versions=[\"${{ inputs.version }}\"]" >> $GITHUB_OUTPUT
+            # Manual run: check if this specific version already exists
+            VER="${{ inputs.version }}"
+            SAFE_VER=$(echo "${VER#v}" | tr '+' '-')
+            if grep -q "^${SAFE_VER}$" existing.txt 2>/dev/null; then
+              echo "::notice::Release ${SAFE_VER} already exists, skipping"
+              echo "versions=[]" >> $GITHUB_OUTPUT
+            else
+              echo "versions=[\"$VER\"]" >> $GITHUB_OUTPUT
+            fi
           else
             RELEASES=$(curl -s "https://api.github.com/repos/k3s-io/k3s/releases?per_page=20" | \
               jq -r '.[] | select(.prerelease == false) | .tag_name' | head -5)
 
             NEW_VERSIONS="[]"
             for ver in $RELEASES; do
-              SAFE_VER=$(echo "$ver" | tr '+' '-')
+              SAFE_VER=$(echo "${ver#v}" | tr '+' '-')
               if ! grep -q "^${SAFE_VER}$" existing.txt 2>/dev/null; then
                 NEW_VERSIONS=$(echo "$NEW_VERSIONS" | jq -c ". + [\"$ver\"]")
               fi
@@ -93,13 +101,6 @@ jobs:
       - name: Create Release
         run: |
           TAG="${{ steps.version.outputs.safe_version }}"
-
-          # Check if release already exists
-          if gh release view "$TAG" &>/dev/null; then
-            echo "::notice::Release $TAG already exists, skipping"
-            exit 0
-          fi
-
           SHA256=$(sha256sum "$TARBALL" | awk '{print $1}')
 
           gh release create "$TAG" \
